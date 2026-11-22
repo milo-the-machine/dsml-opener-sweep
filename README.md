@@ -9,7 +9,7 @@ Christopher Owen reported this ([spark-ds41f](https://github.com/christopherowen
 using a transcript from a coding-agent user (Herlon) at 598K tokens. This repo answers three of his open questions
 with measurements: is it the model or the stack, does it happen at 4K, and which mitigation works.
 
-Full write-up: [REPORT.md](REPORT.md). All tables: [FINAL-TABLES.md](FINAL-TABLES.md). Every failure with
+Blog post with diagrams: https://al-engr.com/dsv41-dsml-missing-opener-three-engines.html . Full write-up: [REPORT.md](REPORT.md). All tables: [FINAL-TABLES.md](FINAL-TABLES.md). Every failure with
 token IDs and decoded token pieces: [`results/failures.jsonl`](results/failures.jsonl).
 
 ## Findings (6,168 requests, 2026-11-22)
