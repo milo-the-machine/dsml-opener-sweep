@@ -80,7 +80,7 @@ assistant history and tool results stays plain text on all three (fix 1 present 
 - `build_sessions.py`: a coding agent session (system + one user task + N `read_file`/`grep`/`write_file`/`pytest`
   turns with `reasoning_content`; tool results are real files and real `grep` output from the vLLM tree) cut at
   4K/64K/200K/400K/598K/800K. Each history ends with a failing `pytest`, so the natural next action is a tool call.
-  Measured prompt tokens: 3,095 / 67,161 / 200,748 / 406,022 / 604,410 / 812,321.
+  Measured prompt tokens: 3,095 / 67,161 / 200,748 / 405,825 / 604,410 / 812,321 (clean; poisoned adds 197).
 - Variants: `clean`; `poisoned` (+ two broken assistant turns, Herlon shape, each followed by user `continue`);
   `poisoned1` (one broken turn); `poisonedfar` (broken turns then 3 normal tool turns, 9–15K tokens);
   `strip`; `drop`; `repair`; `dsmlctx` (6 reads of DSML-heavy DeepSeek encoding docs in the last 30%);
