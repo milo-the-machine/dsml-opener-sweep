@@ -1,0 +1,13 @@
+--- a/vllm/parser/engine/parser_engine_config.py	2026-10-03 03:19:13
++++ b/vllm/parser/engine/parser_engine_config.py	2026-11-22 08:06:18
+@@ -109,6 +109,10 @@
+     # Reject tool calls whose names are absent from the request tools.
+     validate_tool_names: bool = False
+ 
++    # Composite terminals require a genuine token-ID atom inside their spelling
++    # (vLLM PR #65019; not present upstream in v0.31.0).
++    composite_token_id_terminals: dict[str, str] = field(default_factory=dict)
++
+     def terminal_literal(self, name: str) -> str | None:
+         """Canonical spelling of terminal *name*, or ``None`` if undeclared."""
+         value = self.terminals.get(name)

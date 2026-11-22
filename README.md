@@ -24,8 +24,13 @@ token IDs and decoded token pieces: [`results/failures.jsonl`](results/failures.
 | What do the failures look like? | Every one is missing the `invoke name=` line. The parameter tags are written as ordinary tokens (`｜`,`DS`,`ML`,`｜`) in all 42 cases that carry token IDs. A second shape: a real-token `calls` opener followed by no invoke line. Both vLLM parsers drop the body silently and the client gets only the sentence, `finish_reason: stop`. |
 
 Short probes for older bugs (#876 quoted markup becomes a call, #948 closers inside arguments, #446 injection via
-tool result): spark-ds41f 1120 passes all of them. Stock vLLM 0.31 (+ our closer overlay) and SGLang knapcio v2.5
+tool result): spark-ds41f 1120 passes all of them. Stock vLLM 0.31 (+ our closer overlay, before the port below) and SGLang knapcio v2.5
 both turn a quoted, ordinary-token DSML sample in a code block into a real call when a tool is offered (12/12 each).
+
+## Also here
+
+[`vllm-0.31-dsml-provenance-port/`](vllm-0.31-dsml-provenance-port/): the real-token rule (vLLM PR #65019) ported to stock
+vLLM v0.31.0 as a bind-mount overlay, live on our GB300 lane since November 22. The sweep numbers above were measured before it.
 
 ## Rules for agents running this
 

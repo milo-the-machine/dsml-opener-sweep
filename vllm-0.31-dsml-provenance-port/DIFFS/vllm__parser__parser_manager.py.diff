@@ -1,0 +1,32 @@
+--- a/vllm/parser/parser_manager.py	2026-10-03 03:19:13
++++ b/vllm/parser/parser_manager.py	2026-11-22 08:09:42
+@@ -148,6 +148,29 @@
+ 
+             return _CohereCommandParser
+ 
++        if (
++            enable_auto_tools
++            and reasoning_parser_name == "deepseek_v41"
++            and tool_parser_name == "deepseek_v41"
++        ):
++            from vllm.parser.deepseek_v41 import (
++                PROVENANCE_ENABLED,
++                DeepSeekV41ServingParser,
++            )
++
++            # VLLM_DSV41_DSML_TOKEN_PROVENANCE=0 restores stock composition
++            # (two independent engines), i.e. a full rollback of the port.
++            if PROVENANCE_ENABLED:
++                r_cls = reasoning_parser_cls
++                t_cls = tool_parser_cls
++
++                class _DeepSeekV41Parser(DeepSeekV41ServingParser):
++                    reasoning_parser_cls = r_cls
++                    tool_parser_cls = t_cls
++                    tool_strict_level = strict_level
++
++                return _DeepSeekV41Parser
++
+         from vllm.parser.abstract_parser import DelegatingParser
+ 
+         r_cls = reasoning_parser_cls

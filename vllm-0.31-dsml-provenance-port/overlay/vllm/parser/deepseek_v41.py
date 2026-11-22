@@ -1,0 +1,746 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DeepSeek V4.1 reasoning and spaced DSML tool calls.
+
+LOCAL OVERLAY (James Meadlock's lab, 2026-11-22): stock vLLM v0.31.0 file +
+token provenance + "structural closers".
+
+Two rules, both TOOL_ARGS-only (reasoning and content parsing are unchanged
+except where noted):
+
+1. Token provenance (vLLM PR #65019, head cad5796a; the same rule Christopher
+   Owen ships in spark-ds41f 1120). The tokenizer spells every DSML marker as
+   ordinary text around the ``｜DSML｜`` token, so the model can also write any
+   marker with ordinary tokens. Structure now exists only where the real
+   ``｜DSML｜`` token (128825) appears: ``calls``/``invoke``/``parameter``
+   openers and closers count as structure only when their atom arrived as that
+   token. Markup the model *spelled* (a code fence, a quoted example, a
+   reasoning note) stays text, inside string arguments included.
+
+2. Structural closers (our earlier overlay, spark-ds41f#948 class). DSML has no
+   escaping, so a tool argument that contains a *genuine* DSML closer (a file
+   *about* DSML, quoting the format with the real token) used to be cut at that
+   closer: the argument was dropped or truncated, text after it vanished, and
+   the streaming path emitted unterminated JSON. Idea credited to Hector
+   Isaza's patch 0052 in
+   MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold (issue #14,
+   reported by ecohash-co); this is an independent implementation for vLLM.
+   Rules:
+     * ``</parameter>`` ends a value only when what follows is whitespace and
+       then a new ``<parameter name=`` head, or the end of the call's
+       arguments.
+     * ``</invoke>`` / ``</calls>`` end a call only when its arguments are
+       closed (they end with ``</parameter>``, or hold no parameter).
+       Otherwise the closer is held: it becomes structure if the next thing is
+       ``</calls>``, a new ``<invoke``, or the end of the stream (the open
+       parameter is then closed, not dropped), and literal text otherwise.
+     * Every closer kept as text is logged.
+
+The two rules compose: only a *genuine* closer is a candidate boundary at all,
+and a genuine closer that is not followed by structure is still literal text.
+
+Kill switches (each is a full env flip, no rebuild):
+  * ``VLLM_DSV41_STRUCTURAL_DSML=0`` -> rule 2 off (provenance only, i.e. the
+    upstream PR's behaviour).
+  * ``VLLM_DSV41_DSML_TOKEN_PROVENANCE=0`` -> rule 1 off, turn boundaries off
+    and the unified serving parser is not registered: our previous overlay's
+    parse (plus the case (f) preamble fix, which is part of rule 2).
+  * ``VLLM_DSV41_KEEP_OPEN_ARGS=0`` -> an unterminated trailing parameter is
+    dropped, as stock and the upstream PR do. Default keeps it (our rule 2
+    "closed, not dropped" spirit).
+
+If the private engine API this relies on is missing or changed shape, the
+overlay logs an error and stays stock.
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+import json
+import os
+from collections.abc import Iterable, Sequence
+from dataclasses import replace
+
+import regex as re
+
+from vllm.logger import init_logger
+from vllm.parser.abstract_parser import DelegatingParser
+from vllm.parser.deepseek_v4 import (
+    DeepSeekV4Parser,
+    _dsml_arg_converter,
+    _param_patterns,
+    _unwrap_wrapper_args,
+    deepseek_v4_config,
+)
+from vllm.parser.engine.adapters import (
+    ParserEngineReasoningAdapter,
+    ParserEngineToolAdapter,
+)
+from vllm.parser.engine.events import EventType, SemanticEvent
+from vllm.parser.engine.parser_engine_config import ParserEngineConfig
+from vllm.parser.metrics import record_tool_parser_invocation
+
+logger = init_logger(__name__)
+
+DSML_ATOM = "｜DSML｜"
+
+DSML_TOOL_START = "<｜DSML｜ calls>"
+DSML_TOOL_END = "</｜DSML｜ calls>"
+DSML_INVOKE_PREFIX = '<｜DSML｜ invoke name="'
+DSML_INVOKE_END = "</｜DSML｜ invoke>"
+DSML_PARAM_START = "<｜DSML｜ parameter"
+DSML_PARAM_CLOSE = "</｜DSML｜ parameter>"
+
+_PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
+_PARAM_HEAD_RE = re.compile(
+    re.escape(DSML_PARAM_START) + r'\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+)
+# Offset of the atom inside a parameter closer's spelling, for the synthetic
+# closer the engine adds when the model omitted one (see _v41_resolve_structural).
+_PARAM_CLOSE_ATOM = DSML_PARAM_CLOSE.find(DSML_ATOM)
+
+OVERLAY_ID = "dsv41-token-origin-structural-v2"
+
+_ENABLED = os.environ.get("VLLM_DSV41_STRUCTURAL_DSML", "1") != "0"
+PROVENANCE_ENABLED = os.environ.get("VLLM_DSV41_DSML_TOKEN_PROVENANCE", "1") != "0"
+_KEEP_OPEN_ARGS = os.environ.get("VLLM_DSV41_KEEP_OPEN_ARGS", "1") != "0"
+
+# ── structural closer rule (rule 2, text path) ─────────────────────────────
+
+# A complete next-parameter head start, as stock's missing-closer lookahead uses.
+_NEXT_HEAD_RE = re.compile(rf"{re.escape(DSML_PARAM_START)}\s+name=")
+# A parameter head still being written (partial mode only): starts with the tag
+# and has not reached its closing '>' yet.
+_HEAD_IN_PROGRESS_RE = re.compile(rf"{re.escape(DSML_PARAM_START)}(?:\s[^>]*)?$")
+
+
+def _closer_is_structural(raw: str, after: int, partial: bool) -> bool:
+    follower = raw[after:].lstrip()
+    if not follower:
+        return True
+    if _NEXT_HEAD_RE.match(follower):
+        return True
+    if partial and (
+        DSML_PARAM_START.startswith(follower) or _HEAD_IN_PROGRESS_RE.match(follower)
+    ):
+        # Multi-token deltas can end a streaming tick inside the next head. Treat
+        # the closer as structure for this tick; if literal text follows later
+        # the value only grows, which keeps the streamed JSON prefix-stable.
+        return True
+    return False
+
+
+def _find_value_end(raw: str, vstart: int, partial: bool) -> tuple[int, int] | None:
+    """Return (value_end, resume_pos) for the value starting at vstart, or None
+    when the value is still open (no structural closer and no next head)."""
+    pos = vstart
+    head = _NEXT_HEAD_RE.search(raw, vstart)
+    while True:
+        c = raw.find(DSML_PARAM_CLOSE, pos)
+        if head is not None and (c < 0 or head.start() < c):
+            # Stock recovery: a value whose closer is missing ends at the next head.
+            return head.start(), head.start()
+        if c < 0:
+            return None
+        after = c + len(DSML_PARAM_CLOSE)
+        if _closer_is_structural(raw, after, partial):
+            return c, after
+        pos = after  # literal closer inside the value; keep scanning
+
+
+def _store(params: dict, name: str, is_str: str | None, value: str, partial: bool):
+    if is_str == "true":
+        params[name] = value
+        return
+    try:
+        params[name] = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        if not partial:
+            params[name] = value
+        # Partial non-string values that do not parse yet are left out, as stock does.
+
+
+def _structural_dsml_arg_converter(raw_args: str, partial: bool) -> str:
+    """Stock's text-path converter, with the structural rule for closers."""
+    params: dict[str, object] = {}
+    pos = 0
+    while True:
+        m = _PARAM_HEAD_RE.search(raw_args, pos)
+        if not m:
+            break
+        name, is_str = m.group(1), m.group(2)
+        found = _find_value_end(raw_args, m.end(), partial)
+        if found is None:
+            if partial:
+                value = raw_args[m.end() :]
+                if is_str == "true":
+                    params[name] = value
+                else:
+                    try:
+                        params[name] = json.loads(value)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            break
+        vend, pos = found
+        _store(params, name, is_str, raw_args[m.end() : vend], partial=False)
+    return json.dumps(params, ensure_ascii=False)
+
+
+# ── token provenance (rule 1) ──────────────────────────────────────────────
+
+
+def _token_origin_boundaries(
+    raw_args: str, spans: Iterable[tuple[int, int]]
+) -> list[tuple[int, int, re.Match | None]]:
+    """Parameter tags whose DSML atom came from the DSML token, in text order.
+
+    Each entry is ``(start, end, head)``; ``head`` is ``None`` for a closer
+    or an unfinished header, which must not extend the preceding value.
+    """
+    trusted = set(spans)
+    boundaries = []
+    for head in _PARAM_HEAD_RE.finditer(raw_args, partial=True):
+        atom_start = head.start() + 1
+        if (atom_start, atom_start + len(DSML_ATOM)) in trusted:
+            boundaries.append(
+                (head.start(), head.end(), None if head.partial else head)
+            )
+    for close in re.finditer(re.escape(DSML_PARAM_CLOSE), raw_args):
+        atom_start = close.start() + 2
+        if (atom_start, atom_start + len(DSML_ATOM)) in trusted:
+            boundaries.append((close.start(), close.end(), None))
+    boundaries.sort(key=lambda entry: entry[0])
+    return boundaries
+
+
+def _structural_token_origin_boundaries(
+    raw_args: str, spans: Iterable[tuple[int, int]], partial: bool
+) -> list[tuple[int, int, re.Match | None]]:
+    """Token-origin boundaries, keeping a closer only when it is structural.
+
+    A closer whose DSML atom is genuine is still literal text when what follows
+    it is not whitespace + a new head and not the end of the call's arguments.
+    """
+    return [
+        entry
+        for entry in _token_origin_boundaries(raw_args, spans)
+        if entry[2] is not None or _closer_is_structural(raw_args, entry[1], partial)
+    ]
+
+
+def _args_from_boundaries(
+    raw_args: str,
+    partial: bool,
+    boundaries: Sequence[tuple[int, int, re.Match | None]],
+    *,
+    keep_open: bool = False,
+) -> str:
+    """Parse raw arguments from a boundary list (the PR's body, plus keep_open)."""
+    params: dict[str, object] = {}
+    for index, (_, end, head) in enumerate(boundaries):
+        if head is None:
+            continue
+        complete = index + 1 < len(boundaries)
+        if not complete and not partial:
+            if not keep_open or not raw_args[end:].strip():
+                continue
+            # Our rule 2 spirit: a trailing value the model did write is kept,
+            # never turned into a tool call with no arguments. Upstream (and
+            # stock) drop it; VLLM_DSV41_KEEP_OPEN_ARGS=0 restores that.
+        value_end = boundaries[index + 1][0] if complete else len(raw_args)
+        value = raw_args[end:value_end]
+        name, is_str = head.group(1), head.group(2)
+        if is_str == "true":
+            params[name] = value
+        else:
+            try:
+                params[name] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                if complete or (keep_open and not partial):
+                    params[name] = value
+    return json.dumps(params, ensure_ascii=False)
+
+
+def _token_origin_args(
+    raw_args: str,
+    partial: bool,
+    spans: Iterable[tuple[int, int]],
+    *,
+    keep_open: bool = False,
+) -> str:
+    """Parse only parameter boundaries carrying a genuine DSML token atom."""
+    return _args_from_boundaries(
+        raw_args,
+        partial,
+        _token_origin_boundaries(raw_args, spans),
+        keep_open=keep_open,
+    )
+
+
+def _structural_token_origin_args(
+    raw_args: str,
+    partial: bool,
+    spans: Iterable[tuple[int, int]],
+    *,
+    keep_open: bool = False,
+) -> str:
+    """Both rules: genuine atom required, and a closer must be structural."""
+    return _args_from_boundaries(
+        raw_args,
+        partial,
+        _structural_token_origin_boundaries(raw_args, spans, partial),
+        keep_open=keep_open,
+    )
+
+
+# ── engine guard (rule 2's streaming half) ─────────────────────────────────
+
+_V41Engine = None
+
+try:
+    from vllm.parser.engine.parser_engine_config import ParserState
+    from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+
+    _REQUIRED = (
+        "_on_terminal",
+        "_emit_for_state",
+        "finish",
+        "reset",
+        "_process_scanner_items",
+        "_process_lex_tokens",
+        "_record_reasoning_tokens",
+    )
+    _missing = [a for a in _REQUIRED if not hasattr(StreamingParserEngine, a)]
+    if _missing:
+        raise AttributeError(f"StreamingParserEngine lacks {_missing}")
+    for _hook in ("_on_terminal", "_emit_for_state"):
+        if "token_id_spans" not in inspect.signature(
+            getattr(StreamingParserEngine, _hook)
+        ).parameters:
+            # Requires the engine half of the port (token_id_scanner /
+            # incremental_lexer / streaming_parser_engine overlays).
+            raise AttributeError(f"StreamingParserEngine.{_hook} lacks token_id_spans")
+
+    class _V41StructuralEngine(StreamingParserEngine):
+        """Keeps DSML closers that sit inside an open parameter value as text."""
+
+        _v41_args = ""
+        _v41_held = None
+        _v41_held_ws = ""
+
+        def reset(self, initial_state=None) -> None:
+            super().reset(initial_state)
+            self._v41_args = ""
+            self._v41_held = None  # (terminal, value, token_count, token_id_spans)
+            self._v41_held_ws = ""
+            self._v41_preamble = ""
+
+        def _v41_flush_preamble(self):
+            """Text seen after a genuine ``<calls>`` opener that never became a call.
+
+            TOOL_PREAMBLE has no content event, so stock drops that text: a
+            ``<calls>`` opener followed by prose and no invoke line lost the
+            prose. Keep it and emit it as content only when the stream ends
+            without a call; a call starting discards it.
+            """
+            text = self._v41_preamble
+            self._v41_preamble = ""
+            if not text.strip() or self.tool_index >= 0:
+                return []
+            logger.info(
+                "%s: text after a bare DSML calls opener kept as content", OVERLAY_ID
+            )
+            return [
+                SemanticEvent(
+                    EventType.TEXT_CHUNK, value=text, tool_index=self.tool_index
+                )
+            ]
+
+        def _v41_token_origin(self) -> bool:
+            return bool(self._ever_had_token_ids and self._has_composite_ids)
+
+        def _v41_args_closed(self) -> bool:
+            s = self._v41_args.rstrip()
+            return (not s) or (DSML_PARAM_START not in s) or s.endswith(DSML_PARAM_CLOSE)
+
+        def _v41_args_open_param(self) -> bool:
+            """An opened parameter head with no structural closer after it."""
+            s = self._v41_args
+            i = s.rfind(DSML_PARAM_START)
+            if i < 0:
+                return False
+            m = _PARAM_HEAD_RE.match(s, i)
+            if not m:
+                return False
+            return _find_value_end(s, m.end(), partial=False) is None
+
+        def _emit_for_state(self, text: str, token_count: int = 0, token_id_spans=()):
+            if self.state == ParserState.TOOL_PREAMBLE:
+                # Body of a ``<calls>`` opener that has not opened an invoke yet.
+                self._v41_preamble += text
+                if not text.strip():
+                    return []
+            if self.state != ParserState.TOOL_ARGS:
+                return super()._emit_for_state(text, token_count, token_id_spans)
+            events = []
+            if self._v41_held is not None:
+                if not text.strip():
+                    self._v41_held_ws += text
+                    return events
+                events.extend(self._v41_release_literal())
+            self._v41_args += text
+            events.extend(super()._emit_for_state(text, token_count, token_id_spans))
+            return events
+
+        def _v41_release_literal(self):
+            terminal, value, _, _ = self._v41_held
+            text = value + self._v41_held_ws
+            self._v41_held = None
+            self._v41_held_ws = ""
+            logger.info(
+                "%s: DSML %s inside a parameter value kept as text (call %d)",
+                OVERLAY_ID,
+                terminal,
+                self.tool_index,
+            )
+            self._v41_args += text
+            # No spans: the released closer is literal text, so the token-origin
+            # converter must not read it as a parameter boundary.
+            return StreamingParserEngine._emit_for_state(self, text, 0)
+
+        def _v41_resolve_structural(self):
+            terminal, value, token_count, token_id_spans = self._v41_held
+            ws = self._v41_held_ws
+            self._v41_held = None
+            self._v41_held_ws = ""
+            events = []
+            if self._v41_args_open_param():
+                # Model omitted the parameter closer: close it so the value is kept.
+                # Under token provenance the synthetic closer must carry the atom's
+                # span, or the token-origin converter would read it as text and drop
+                # the value; the overlay's decision is what marks it as structure.
+                spans = (
+                    ((_PARAM_CLOSE_ATOM, _PARAM_CLOSE_ATOM + len(DSML_ATOM)),)
+                    if self._v41_token_origin()
+                    else ()
+                )
+                self._v41_args += DSML_PARAM_CLOSE
+                events.extend(
+                    StreamingParserEngine._emit_for_state(
+                        self, DSML_PARAM_CLOSE, 0, spans
+                    )
+                )
+            events.extend(super()._on_terminal(terminal, value, token_count, token_id_spans))
+            if ws:
+                events.extend(self._emit_for_state(ws, 0))
+            return events
+
+        def _on_terminal(
+            self, terminal: str, value: str, token_count: int = 0, token_id_spans=()
+        ):
+            if self.state == ParserState.TOOL_ARGS:
+                events = []
+                if self._v41_held is not None:
+                    if terminal in ("TOOL_END", "INVOKE_PREFIX"):
+                        events.extend(self._v41_resolve_structural())
+                        events.extend(
+                            self._on_terminal(
+                                terminal, value, token_count, token_id_spans
+                            )
+                        )
+                        return events
+                    events.extend(self._v41_release_literal())
+                if terminal in (
+                    "INVOKE_END",
+                    "TOOL_END",
+                ) and not self._v41_args_closed():
+                    self._v41_held = (terminal, value, token_count, token_id_spans)
+                    self._v41_held_ws = ""
+                    return events
+                events.extend(
+                    self._v41_on_terminal_tracked(
+                        terminal, value, token_count, token_id_spans
+                    )
+                )
+                return events
+            return self._v41_on_terminal_tracked(
+                terminal, value, token_count, token_id_spans
+            )
+
+        def _v41_on_terminal_tracked(
+            self, terminal, value, token_count, token_id_spans
+        ):
+            before = self.state
+            events = super()._on_terminal(
+                terminal, value, token_count, token_id_spans
+            )
+            if before == ParserState.TOOL_PREAMBLE and self.state != ParserState.TOOL_PREAMBLE:
+                # A call is starting: preamble text belongs to it, not content.
+                self._v41_preamble = ""
+            if before != ParserState.TOOL_ARGS and self.state == ParserState.TOOL_ARGS:
+                self._v41_args = ""
+                self._v41_held = None
+                self._v41_held_ws = ""
+            return events
+
+        def finish(self):
+            if self._v41_held is None:
+                events = super().finish()
+            else:
+                events = self._process_scanner_items(self._scanner.flush_pending())
+                events.extend(self._process_lex_tokens(self._lexer.flush()))
+                if self._v41_held is not None and self.state == ParserState.TOOL_ARGS:
+                    events.extend(self._v41_resolve_structural())
+                self._record_reasoning_tokens(events)
+                events.extend(super().finish())
+            events.extend(self._v41_flush_preamble())
+            return events
+
+    _V41Engine = _V41StructuralEngine
+except Exception as e:  # noqa: BLE001
+    logger.error("%s: structural DSML overlay disabled (stock behaviour): %s", OVERLAY_ID, e)
+    _V41Engine = None
+
+_STRUCTURAL_ACTIVE = _ENABLED and _V41Engine is not None
+
+
+# ── config ────────────────────────────────────────────────────────────────
+
+
+@functools.cache
+def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+    config = deepseek_v4_config(thinking=thinking)
+    terminal_overrides = {
+        "TOOL_START": DSML_TOOL_START,
+        "TOOL_END": DSML_TOOL_END,
+        "INVOKE_PREFIX": DSML_INVOKE_PREFIX,
+        "INVOKE_END": DSML_INVOKE_END,
+        "PARAM_START": DSML_PARAM_START,
+        "PARAM_CLOSE": DSML_PARAM_CLOSE,
+    }
+    if _STRUCTURAL_ACTIVE:
+        converter = _structural_dsml_arg_converter
+    else:
+        converter = functools.partial(
+            _dsml_arg_converter,
+            param_re=_PARAM_RE,
+            partial_param_re=_PARTIAL_PARAM_RE,
+        )
+    token_id_terminals = {
+        key: terminal_overrides.get(key, value)
+        for key, value in config.token_id_terminals.items()
+    }
+    composite: dict[str, str] = {}
+    turn_boundaries: frozenset[str] = frozenset()
+    if PROVENANCE_ENABLED:
+        # The atom itself becomes a token terminal: the engine feeds its text
+        # back into the lexer with a trusted span instead of dropping it, and
+        # every composite marker spelling is then gated on that span.
+        token_id_terminals["DSML_ATOM"] = DSML_ATOM
+        composite = dict.fromkeys(terminal_overrides, "DSML_ATOM")
+        # A closing marker from an earlier turn must not decide this turn's
+        # reasoning state (PR #65019; needs ParserEngineConfig, which has had
+        # turn_boundary_tokens since v0.31.0).
+        turn_boundaries = frozenset({"<｜Assistant｜>", "<｜User｜>", "<｜System｜>"})
+    return replace(
+        config,
+        name="deepseek_v41",
+        turn_boundary_tokens=turn_boundaries,
+        terminals={**config.terminals, **terminal_overrides},
+        token_id_terminals=token_id_terminals,
+        composite_token_id_terminals=composite,
+        arg_converter=converter,
+    )
+
+
+class DeepSeekV41Parser(DeepSeekV4Parser):
+    parser_config = staticmethod(deepseek_v41_config)
+
+    def __init__(self, tokenizer, tools=None, **kwargs) -> None:
+        super().__init__(tokenizer, tools, **kwargs)
+        if _STRUCTURAL_ACTIVE:
+            self._engine = _V41Engine(
+                self.parser_engine_config, tokenizer, vocab=self.vocab
+            )
+        if PROVENANCE_ENABLED:
+            atom_id = self.vocab.get(DSML_ATOM)
+            special = DSML_ATOM in set(
+                getattr(tokenizer, "all_special_tokens", ()) or ()
+            )
+            if getattr(self._engine, "_has_composite_ids", False):
+                logger.info_once(
+                    "%s: DSML token provenance active (atom id %s, special=%s)",
+                    OVERLAY_ID,
+                    atom_id,
+                    special,
+                )
+            else:
+                logger.warning_once(
+                    "%s: DSML token provenance INERT: tokenizer has no %r token "
+                    "(id %s, special=%s); DSML matching is text-based",
+                    OVERLAY_ID,
+                    DSML_ATOM,
+                    atom_id,
+                    special,
+                )
+
+    @property
+    def _token_origin(self) -> bool:
+        return (
+            PROVENANCE_ENABLED
+            and self._engine._ever_had_token_ids
+            and self._engine._has_composite_ids
+        )
+
+    def _arg_slot(self, raw_args: str):
+        return next(
+            (slot for slot in reversed(self._tool_slots) if slot.args is raw_args), None
+        )
+
+    def _convert_args(self, raw_args: str, partial: bool) -> str:
+        if not self._token_origin:
+            return super()._convert_args(raw_args, partial)
+        slot = self._arg_slot(raw_args)
+        spans = (slot.arg_token_id_spans if slot is not None else None) or ()
+        if slot is None or not spans:
+            # No token provenance recorded for this slot (the deltas carried no
+            # token IDs, e.g. a text-only replay): fall back to the text path
+            # rather than parse zero boundaries and drop every argument.
+            return super()._convert_args(raw_args, partial)
+        if _STRUCTURAL_ACTIVE:
+            result = _structural_token_origin_args(
+                raw_args, partial, spans, keep_open=_KEEP_OPEN_ARGS
+            )
+        else:
+            result = _token_origin_args(
+                raw_args, partial, spans, keep_open=_KEEP_OPEN_ARGS
+            )
+        return _unwrap_wrapper_args(
+            result, self._tools, slot.name if slot is not None else None
+        )
+
+
+class DeepSeekV41ServingParser(DelegatingParser):
+    """Keep serving adapters and request constraints around one output engine.
+
+    DelegatingParser (v0.31.0) parses reasoning and tool calls with two separate
+    engine instances and hands the tool parser only text, so token IDs are lost
+    before tool parsing in non-streaming. This class routes both phases through
+    the reasoning adapter's engine, which therefore sees the token IDs of the
+    whole output, including the reasoning-to-tool handoff.
+    """
+
+    def __init__(self, tokenizer, tools=None, **kwargs):
+        super().__init__(tokenizer, tools, **kwargs)
+        reasoning_adapter, tool_adapter = self._reasoning_parser, self._tool_parser
+        assert isinstance(reasoning_adapter, ParserEngineReasoningAdapter)
+        assert isinstance(tool_adapter, ParserEngineToolAdapter)
+        self._reasoning_adapter = reasoning_adapter
+        self._unified_parser = reasoning_adapter._parser_engine
+        self._unified_parser._tools = tools
+        self._unified_parser._stream_state = self._stream_state
+        tool_adapter._parser_engine = self._unified_parser
+        self._skip_tools_override = False
+
+    @property
+    def skip_tool_parsing(self):
+        return self._unified_parser.skip_tool_parsing
+
+    @skip_tool_parsing.setter
+    def skip_tool_parsing(self, value):
+        self._skip_tools_override = value
+        self._unified_parser.skip_tool_parsing = value
+
+    def _prepare_tools(self, request, enable_auto_tools=True):
+        self._unified_parser.skip_tool_parsing = (
+            self._skip_tools_override
+            or request.tool_choice == "none"
+            or not request.tools
+            or not enable_auto_tools
+        )
+        self._unified_parser._suppress_tool_calls = False
+
+    def _sync_reasoning(self):
+        self._reasoning_adapter._streaming_count_valid = True
+        self._stream_state.reasoning_ended = self._unified_parser.reasoning_ended
+
+    def _uses_json_tool_choice(self, request):
+        return (
+            self._tool_parser is not None
+            and self._tool_parser.supports_required_and_named
+            and request.tool_choice not in (None, "auto", "none")
+        )
+
+    def parse(
+        self, model_output, request, enable_auto_tools=False, model_output_token_ids=()
+    ):
+        if self._uses_json_tool_choice(request):
+            # Reasoning still needs token provenance before JSON tool dispatch.
+            with self._reasoning_adapter._skip_tool_parsing():
+                reasoning, content, _ = self._unified_parser.parse(
+                    model_output, request, enable_auto_tools, model_output_token_ids
+                )
+            self._sync_reasoning()
+            tool_calls, content = self._extract_tool_calls(
+                content, request, enable_auto_tools
+            )
+            return reasoning, content, tool_calls
+        self._prepare_tools(request, enable_auto_tools)
+        is_tool_called: bool | Exception = False
+        try:
+            result = self._unified_parser.parse(
+                model_output, request, enable_auto_tools, model_output_token_ids
+            )
+            is_tool_called = bool(result[2])
+            self._sync_reasoning()
+            return result
+        except Exception as e:
+            is_tool_called = e
+            raise
+        finally:
+            record_tool_parser_invocation(
+                is_tool_called=is_tool_called, is_streaming=False, request=request
+            )
+
+    def parse_delta(
+        self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished
+    ):
+        if self._uses_json_tool_choice(request):
+            # The required-choice JSON scanner needs accumulated output text.
+            self._stream_state.engine_based = False
+            return super().parse_delta(
+                delta_text,
+                delta_token_ids,
+                request,
+                prompt_token_ids,
+                finished=finished,
+            )
+        self._prepare_tools(request)
+        is_tool_called: bool | Exception = False
+        try:
+            result = self._unified_parser.parse_delta(
+                delta_text,
+                delta_token_ids,
+                request,
+                prompt_token_ids,
+                finished=finished,
+            )
+            is_tool_called = bool(result and result.tool_calls)
+            self._sync_reasoning()
+            return result
+        except Exception as e:
+            is_tool_called = e
+            raise
+        finally:
+            record_tool_parser_invocation(
+                is_tool_called=is_tool_called, is_streaming=True, request=request
+            )
+
+
+if _STRUCTURAL_ACTIVE:
+    logger.info(
+        "%s: structural DSML closers active (token provenance %s)",
+        OVERLAY_ID,
+        "on" if PROVENANCE_ENABLED else "off",
+    )

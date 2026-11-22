@@ -127,7 +127,7 @@ Excluded from failures: 4 long, honest give-up replies ("I wasn't able to fix th
   streaming reply, reasoning that quoted the DSML format ("I'll follow the reference format exactly: `<｜DSML｜ …`")
   was parsed as structure. That produced a tool call named `"..."` whose argument held the reasoning text. A
   text-based parser has no defence against either. Port the token-provenance rule (Owen 1120 / vLLM #65019) to
-  the GB300 overlay.
+  the GB300 overlay. **Done the same day (Pg65, 08:37 CST): probes 42/42 after; all sweep numbers above are from before the change.**
 - **SGLang knapcio v2.5:** bug 3 present with tools offered (6/6 + 6/6). Worth reporting to knapcio.
 - **1120 oddities (1 each, not reproduced):** at 800K, poisoned, streaming: the reply was `"\n\n"` + shape B. At
   800K, strip, streaming: the whole reply was 2 tokens, `Let` in reasoning and then EOS inside thinking.

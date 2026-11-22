@@ -1,0 +1,78 @@
+--- a/vllm/parser/engine/parser_engine.py	2026-10-03 03:19:13
++++ b/vllm/parser/engine/parser_engine.py	2026-11-22 08:06:18
+@@ -54,6 +54,8 @@
+         "name_sent",
+         "string_keys",
+         "streamed_json",
++        "arg_token_id_spans",
++        "_args_length",
+     )
+ 
+     def __init__(self) -> None:
+@@ -64,6 +66,8 @@
+         self.name_sent: bool = False
+         self.string_keys: set[str] | None = None
+         self.streamed_json: str = ""
++        self.arg_token_id_spans: list[tuple[int, int]] | None = None
++        self._args_length = 0
+ 
+     @property
+     def args(self) -> str:
+@@ -71,7 +75,17 @@
+             self._args_joined = "".join(self._args_parts)
+         return self._args_joined
+ 
+-    def append_args(self, value: str) -> None:
++    def append_args(
++        self, value: str, token_id_spans: tuple[tuple[int, int], ...] = ()
++    ) -> None:
++        if token_id_spans:
++            if self.arg_token_id_spans is None:
++                self.arg_token_id_spans = []
++            self.arg_token_id_spans.extend(
++                (start + self._args_length, end + self._args_length)
++                for start, end in token_id_spans
++            )
++        self._args_length += len(value)
+         self._args_parts.append(value)
+         self._args_joined = None
+ 
+@@ -785,12 +799,15 @@
+         reasoning_parts: list[str] = []
+ 
+         carried_deferred = self._deferred_content
++        # Token-ID composite parsers keep text between tool calls; text must
++        # not overtake content deferred from an earlier delta.
++        defer_text = bool(carried_deferred) and self._engine._has_composite_ids
+         seen_tool_event = False
+         suppress = self._suppress_tool_calls
+         for event in events:
+             match event.type:
+                 case EventType.TEXT_CHUNK:
+-                    if seen_tool_event:
++                    if seen_tool_event or defer_text:
+                         self._deferred_content += event.value
+                     else:
+                         content_parts.append(event.value)
+@@ -820,7 +837,11 @@
+         if len(tool_call_deltas) > 1:
+             tool_call_deltas = self._coalesce_tool_call_deltas(tool_call_deltas)
+ 
+-        if self._deferred_content and (not seen_tool_event or not tool_call_deltas):
++        if self._deferred_content and (
++            not seen_tool_event
++            or not tool_call_deltas
++            or (finished and self._engine._has_composite_ids)
++        ):
+             # Deferred content carried in from a previous delta precedes this
+             # delta's content; content deferred during this call (text after
+             # an unpromoted tool event) follows it.
+@@ -910,7 +931,7 @@
+         idx = event.tool_index
+         slot = self._tool_slots[idx]
+         if event.value:
+-            slot.append_args(event.value)
++            slot.append_args(event.value, getattr(event, "token_id_spans", ()))
+ 
+         if not slot.name_sent:
+             if slot.name:
